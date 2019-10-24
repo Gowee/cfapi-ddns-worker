@@ -1,5 +1,5 @@
 // CloudFlare API token
-// for zone:... (Edit)
+// for zone: example.com (Edit)
 const API_TOKEN = "9TEbDiJr2OPLPHeaAm9co4cPcc6aCyXw3eFCqQRZ";
 // Currently, there seems not to be a way to get zone ids with tokens. So hardcode it here.
 // https://community.cloudflare.com/t/bug-in-list-zones-endpoint-when-using-api-token/115048
