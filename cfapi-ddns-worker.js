@@ -1,28 +1,73 @@
 // CloudFlare API token
 // for zone: example.com (Edit)
-const API_TOKEN = "9TEbDiJr2OPLPHeaAm9co4cPcc6aCyXw3eFCqQRZ";
+const CLOUDFLARE_API_TOKEN = "TO_BE_FILLED";
 // Currently, there seems not to be a way to get zone ids with tokens. So hardcode it here.
 // https://community.cloudflare.com/t/bug-in-list-zones-endpoint-when-using-api-token/115048
+// Trailing dots CANNOT BE OMITTED.
 const ZONES = {
-  "example.com.": { 
-    id: "ebb79c493284ba2be5cc932ef944e41b"
+  "example.org.": {
+    id: "TO_BE_FILLED"
   },
 };
-// API tokens, mapping domains to customizable tokens, which can be any text.
+// Arbitrary API tokens, mapping domains to customizable tokens, which can be any text.
 // Tokens for a domain can always be used to access its direct or indirect subdomains.
+// Trailing dots CANNOT BE OMITTED.
 const TOKENS = /* TOKENS: */ {
-  "dyn.example.com.": "5b9ecec4-8e23-4ffc-8e9b-b1f7d37f5ef5",
-  "bomb.dyn.example.com.": "88a9af6a-53aa-4757-91be-a15497626452",
+  "example.org.": "b69541a8-0acd-4e14-aecf-053d5e1b923d",
+  "foo.example.org.": "144e7c59-7c2b-4360-9d16-00bbad549fb9",
+  "foo.bar.example.org.": "218fa52e-d3c9-419d-a800-d8510e899a30",
 } /* :TOKENS */;
 // Time To Live in DNS record. 1 indictes automatic.
 const TTL = 1;
-// Currently, the script won't create record for non-existent (sub)domains.
-//const AUTO_CREATE = true;
 
-class ClientError extends Error {}
+class Flare {
+  constructor(api_token) {
+    this.api_token = api_token;
+  }
+
+  async request(method, path, data) {
+    const response = await fetch("https://api.cloudflare.com/client/v4/" + path, {
+      method: method,
+      headers: {
+        "Authorization": `Bearer ${this.api_token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Upstream response error (status code: ${response.status})`);
+    }
+    try {
+      return await response.json();
+    }
+    catch (e) {
+      throw new Error("Upstream invalid response");
+    }
+  }
+
+  get(path, data) {
+    return this.request("GET", path, data);
+  }
+
+  post(path, data) {
+    return this.request("POST", path, data);
+  }
+
+  put(path, data) {
+    return this.request("PUT", path, data);
+  }
+
+  delete(path, data) {
+    return this.request("delete", path, data);
+  }
+}
+
+const flare = new Flare(CLOUDFLARE_API_TOKEN);
+
+class ClientError extends Error { }
 
 addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request))
+  event.respondWith(handleRequest(event.request));
 })
 
 /**
@@ -31,13 +76,21 @@ addEventListener('fetch', event => {
  */
 async function handleRequest(request) {
   const url = new URL(request.url);
+  if (url.pathname === "/") {
+    return new Response("cfapi-ddns-worker.js is up");
+  }
   try {
-      if (url.pathname.startsWith("/update/")) {
-        return await handleUpdate(request);
+    const path = url.pathname.startsWith("/") ? url.pathname.substring(1) : url.pathname;
+    const [action, token, domain, rtype, content] = path.split("/", 5);
+    if (["update", "create", "delete", "upsert"].includes(action)) {
+      if ([token, domain, rtype, content].some((e) => e === undefined)) {
+        throw new ClientError("Parameters Missing");
       }
-      else {
-        return new Response(`Resource Not Found at Endpoint ${url.pathname}`, { status: 404 });
-      }
+      return await handleAction(action, token, domain, rtype, content);
+    }
+    else {
+      return new Response(`Unsupported action: ${action}`, { status: 404 });
+    }
   }
   catch (e) {
     if (e instanceof ClientError) {
@@ -49,13 +102,7 @@ async function handleRequest(request) {
   }
 }
 
-async function handleUpdate(request) {
-  const url = new URL(request.url);
-  const path = url.pathname.startsWith("/") ? url.pathname.substring(1) : url.pathname;
-  const [, token, domain, rtype, content] = path.split("/", 5);
-  if ([token, domain, rtype, content].some((e) => e === undefined)) {
-    throw new ClientError("Malformed parameters");
-  }
+async function handleAction(action, token, domain, rtype, content) {
   const canon_domain = canonicalizeDomain(domain);
   const effective_domain = getEffectiveDomain(token, canon_domain);
   if (effective_domain === undefined) {
@@ -63,53 +110,43 @@ async function handleUpdate(request) {
   }
   let { id: zone_id } = getZoneByDomain(effective_domain);
   if (zone_id === undefined) {
-    throw new ClientError("Unknown zone");
+    throw new ClientError(`Zone ID has not been specified for the domain ${effective_domain}`);
   }
-  const records = (await getAPI(`zones/${zone_id}/dns_records?name=${simplifyDomain(domain)}&type=${rtype}`)).result;
-  if (records.length === 0) {
-    throw new ClientError("Record Not Found");
+  const records = (await flare.get(`zones/${zone_id}/dns_records?name=${simplifyDomain(domain)}&type=${rtype}`)).result;
+  if (action === "upsert" && records.length === 0) {
+    action = "create";
   }
-  else if (records.length > 1) { 
-    throw new ClientError("Records Not Unique");
+  else {
+    action = "update";
   }
-  const record_id = records[0].id;
-  const result = await putAPI(`zones/${zone_id}/dns_records/${record_id}`, {type: rtype, name: simplifyDomain(domain), content: content});
+  let result;
+  switch (action) {
+    case "create":
+      if (records.length > 0) {
+        throw new ClientError("Record Already Existing");
+      }
+      result = await flare.post(`zones/${zone_id}/dns_records`, { type: rtype, name: simplifyDomain(domain), content: content });
+      break;
+    case "update":
+    case "delete":
+      if (records.length > 1) {
+        throw new ClientError("Record Not Unique");
+      }
+      else if (records.length == 0) {
+        throw new ClientError("Record Not Found")
+      }
+      const record_id = records[0].id;
+      if (action === "update") {
+        result = await flare.put(`zones/${zone_id}/dns_records/${record_id}`, { type: rtype, name: simplifyDomain(domain), content: content });
+      } else { // delete
+        result = await flare.delete(`zones/${zone_id}/dns_records/${record_id}`);
+      }
+      break;
+  }
   if (!result.success) {
     throw new Error(`Upstream erorr (${errors})`);
   }
   return new Response(`Successfully Updated at ${new Date()}`, { status: 200 });
-}
-
-async function requestAPI(method, path, data) {
-  const response = await fetch("https://api.cloudflare.com/client/v4/" + path, {
-    method: method,
-    headers: {
-      "Authorization": `Bearer ${API_TOKEN}`,
-      "Content-Type": "application/json"
-      },
-    body: JSON.stringify(data),
-  });
-  if (!response.ok) {
-    throw new Error(`Upstream response error (status code: ${response.status})`);
-  }
-  try {
-    return await response.json();
-  }
-  catch (e) {
-    throw new Error("Upstream invalid response");
-  }
-}
-
-function getAPI(path, data) {
-  return requestAPI("GET", path, data);
-}
-
-function postAPI(path, data) {
-  return requestAPI("POST", path, data);
-}
-
-function putAPI(path, data) {
-  return requestAPI("PUT", path, data);
 }
 
 // Search predefined ZONES for matching domain, returning the matched zone.
@@ -128,7 +165,8 @@ function getZoneByDomain(domain) {
 function getEffectiveDomain(token, domain) {
   let effective_domain;
   for (const parent_domain of parentDomains(domain)) {
-    if (TOKENS[parent_domain] === token) {
+    console.log(parent_domain, TOKENS[parent_domain]);
+    if (TOKENS[parent_domain] && TOKENS[parent_domain] === token) {
       effective_domain = parent_domain;
       break;
     }
@@ -167,3 +205,4 @@ function canonicalizeDomain(domain) {
   }
   return domain;
 }
+
